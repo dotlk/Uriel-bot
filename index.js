@@ -13,6 +13,12 @@ loadEmojiDictionary();
 require("./src/events/ready")(client);
 require("./src/events/messageCreate")(client);
 require("./src/events/interactionCreate")(client);
+require("./src/events/voiceStateUpdate")(client);
+
+// Evita que um erro não tratado em algum handler derrube o bot inteiro
+process.on("unhandledRejection", (error) => {
+    console.error("❌ Unhandled promise rejection:", error);
+});
 
 console.log("🚀 Tentando conectar...");
 

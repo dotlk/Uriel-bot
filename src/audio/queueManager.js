@@ -16,37 +16,36 @@ const { getUserVoice } = require("../../configManager");
 // Pasta onde os áudios temporários são salvos
 const AUDIO_DIR = path.join(__dirname, "..", "..", "audio");
 
+// Limites anti-spam: quantas falas podem esperar na fila
+const MAX_QUEUE_SIZE = 20;
+const MAX_PENDING_PER_USER = 3;
+
+// Tempo sem falar depois do qual o nome do autor volta a ser anunciado
+const AUTHOR_ANNOUNCE_TIMEOUT_MS = 60_000;
+
 const players = new Map();
-// Estrutura da Fila: Map<guildId, Array<{ text, userId, ready, readyAt, audioPath, audioPromise }>>
-const audioQueues = new Map();
-const isPlayingMap = new Map();
-const lastSpeakerMap = new Map();
 
-// "Sinal" de mudança de fila por servidor — usado pra acordar quem estiver
-// esperando (via Promise.race) assim que um item novo entrar na fila.
-// Sem isso, um item lento que já está sendo esperado "esconde" um item novo
-// que termine de gerar mais rápido (ele fica pronto mas ninguém percebe até
-// o item antigo resolver/falhar).
-const queueSignals = new Map(); // guildId -> { promise, resolve }
+// Estado de cada servidor:
+// { queue: Array<{ text, userId, audioPromise }>, processing: boolean, lastSpeaker: { userId, at } | null }
+// Quando o bot sai da call o estado é descartado; um loop de reprodução que ainda estava
+// rodando percebe que o objeto mudou e para sozinho.
+const guildStates = new Map();
 
-function getQueueSignal(guildId) {
-    if (!queueSignals.has(guildId)) {
-        let resolveFn;
-        const promise = new Promise(resolve => { resolveFn = resolve; });
-        queueSignals.set(guildId, { promise, resolve: resolveFn });
+function getState(guildId) {
+    if (!guildStates.has(guildId)) {
+        guildStates.set(guildId, { queue: [], processing: false, lastSpeaker: null });
     }
-    return queueSignals.get(guildId);
+    return guildStates.get(guildId);
 }
 
-function signalQueueChange(guildId) {
-    const signal = queueSignals.get(guildId);
-    if (signal) {
-        signal.resolve();
-        queueSignals.delete(guildId); // a próxima espera cria um sinal novo
-    }
+function safeUnlink(filePath) {
+    if (!filePath) return;
+    fs.rm(filePath, { force: true }, (err) => {
+        if (err) console.error(`❌ Erro ao deletar o arquivo ${filePath}:`, err.message);
+    });
 }
 
-// 🧹 Limpa arquivos MP3 não utilizados no diretório de áudio
+// 🧹 Limpa áudios temporários que sobraram de execuções passadas
 function cleanAudioFolder() {
     if (!fs.existsSync(AUDIO_DIR)) return;
 
@@ -54,35 +53,21 @@ function cleanAudioFolder() {
         if (err) return console.error("❌ Erro ao ler pasta de áudios:", err);
 
         for (const file of files) {
-            if (file.endsWith(".mp3")) {
-                const filePath = path.join(AUDIO_DIR, file);
-                fs.unlink(filePath, (unlinkErr) => {
-                    if (!unlinkErr) console.log(`🧹 Áudio antigo/órfão removido: ${file}`);
-                });
+            if (file.endsWith(".mp3") || file.endsWith(".wav")) {
+                safeUnlink(path.join(AUDIO_DIR, file));
+                console.log(`🧹 Áudio antigo/órfão removido: ${file}`);
             }
         }
     });
 }
 
-// 🧹 Apaga todos os MP3 pendentes de uma fila específica ao cancelar/sair
+// 🧹 Descarta a fila de um servidor e apaga os áudios que ainda não foram tocados
 async function clearGuildQueue(guildId) {
-    const queue = audioQueues.get(guildId);
-    if (!queue) return;
+    const state = guildStates.get(guildId);
+    if (!state) return;
 
-    for (const item of queue) {
-        try {
-            const audioPath = await item.audioPromise;
-            if (audioPath && fs.existsSync(audioPath)) {
-                fs.unlink(audioPath, (err) => {
-                    if (!err) console.log(`🗑️ Áudio cancelado excluído: ${audioPath}`);
-                });
-            }
-        } catch (e) {
-            // Ignora se o áudio nem chegou a ser gerado
-        }
-    }
-
-    audioQueues.delete(guildId);
+    const pending = state.queue.splice(0);
+    await Promise.all(pending.map(async (item) => safeUnlink(await item.audioPromise)));
 }
 
 function getPlayer(guildId) {
@@ -93,10 +78,9 @@ function getPlayer(guildId) {
             console.log(`🎵 ${guildId}: ${oldState.status} -> ${newState.status}`);
         });
 
+        // O erro sempre vem seguido de uma transição pra Idle, que é quem libera a fila.
         player.on("error", error => {
-            console.error("❌ Player error:", error);
-            isPlayingMap.set(guildId, false);
-            processQueue(guildId);
+            console.error("❌ Player error:", error.message);
         });
 
         players.set(guildId, player);
@@ -110,143 +94,137 @@ function getExistingPlayer(guildId) {
     return players.get(guildId);
 }
 
-function queueSpeech(text, guildId, userId) {
-    if (!audioQueues.has(guildId)) {
-        audioQueues.set(guildId, []);
-    }
-
-    // userVoice agora é um objeto: { type: "edge" | "clone", value: string }
-    const userVoice = getUserVoice(guildId, userId);
-    console.log(`⚡ [${userVoice.type}:${userVoice.value}] Pré-gerando áudio em background para o usuário ${userId}: "${text}"`);
-
-    // O item guarda seu próprio estado de "pronto" (ready/readyAt/audioPath),
-    // pra fila poder tocar quem terminar de gerar primeiro — não necessariamente quem chegou primeiro.
-    const item = { text, userId, ready: false, audioPath: null, readyAt: null };
-
-    item.audioPromise = generateSpeech(text, userVoice)
-        .then(audioPath => {
-            item.audioPath = audioPath;
-            item.ready = true;
-            item.readyAt = Date.now();
-            return audioPath;
-        })
-        .catch(err => {
-            console.error("❌ Erro ao pré-gerar MP3:", err.message || err);
-            item.audioPath = null;
-            item.ready = true;
-            item.readyAt = Date.now();
-            return null;
-        });
-
-    audioQueues.get(guildId).push(item);
-    signalQueueChange(guildId); // 👈 acorda quem estiver esperando na fila (Promise.race antigo)
-    processQueue(guildId);
-}
-
-// Escolhe, entre os itens já prontos na fila, o que terminou de gerar primeiro
-function pickNextReady(queue) {
-    const readyItems = queue.filter(item => item.ready);
-    if (readyItems.length === 0) return null;
-
-    return readyItems.reduce((earliest, item) =>
-        item.readyAt < earliest.readyAt ? item : earliest
-    );
-}
-
-async function processQueue(guildId) {
-    if (isPlayingMap.get(guildId)) return;
-
-    const queue = audioQueues.get(guildId);
-    if (!queue || queue.length === 0) return;
-
+function isConnectionReady(guildId) {
     const connection = getVoiceConnection(guildId);
-    if (!connection || connection.state.status !== VoiceConnectionStatus.Ready) {
-        console.log("⚠️ Bot não está conectado ou não está pronto no canal de voz.");
-        return;
+    return !!connection && connection.state.status === VoiceConnectionStatus.Ready;
+}
+
+// Coloca uma fala na fila. O áudio começa a ser gerado na hora (em paralelo com o que
+// estiver tocando), mas a reprodução respeita a ordem de chegada das mensagens.
+// Retorna false se a fala foi descartada pelos limites anti-spam.
+function queueSpeech(text, guildId, userId) {
+    const state = getState(guildId);
+
+    if (state.queue.length >= MAX_QUEUE_SIZE) {
+        console.log(`⚠️ Fila do servidor ${guildId} cheia, mensagem ignorada.`);
+        return false;
     }
 
-    isPlayingMap.set(guildId, true);
-
-    // Tenta achar algo que já esteja pronto. Se nada estiver pronto ainda,
-    // espera até QUALQUER item da fila terminar de gerar (o primeiro a resolver "ganha" a vez)
-    // OU até a fila mudar (um item novo entrou) — nesse caso, reavalia do zero,
-    // incluindo a promessa do item recém-chegado na próxima espera.
-    let nextItem = pickNextReady(queue);
-    while (!nextItem) {
-        const { promise: changeSignal } = getQueueSignal(guildId);
-        await Promise.race([...queue.map(item => item.audioPromise), changeSignal]);
-        nextItem = pickNextReady(queue);
+    if (state.queue.filter(item => item.userId === userId).length >= MAX_PENDING_PER_USER) {
+        console.log(`⚠️ Usuário ${userId} já tem ${MAX_PENDING_PER_USER} falas na fila, mensagem ignorada.`);
+        return false;
     }
 
-    // Corrida rara (ex: a fila foi esvaziada por um /leave enquanto esperava) — tenta de novo
-    if (!nextItem) {
-        isPlayingMap.set(guildId, false);
-        return processQueue(guildId);
-    }
+    // userVoice é um objeto: { type: "edge" | "clone", value: string }
+    const userVoice = getUserVoice(guildId, userId);
+    console.log(`⚡ [${userVoice.type}:${userVoice.value}] Pré-gerando áudio para o usuário ${userId}: "${text}"`);
 
-    queue.splice(queue.indexOf(nextItem), 1);
-    const { audioPath } = nextItem;
+    const audioPromise = generateSpeech(text, userVoice).catch(err => {
+        console.error("❌ Erro ao gerar áudio:", err.message || err);
+        return null;
+    });
 
-    try {
-        if (!audioPath || !fs.existsSync(audioPath)) {
-            console.error("❌ Arquivo de áudio inválido ou não encontrado.");
-            isPlayingMap.set(guildId, false);
-            return processQueue(guildId);
-        }
+    state.queue.push({ text, userId, audioPromise });
+    processQueue(guildId);
+    return true;
+}
 
-        const stream = fs.createReadStream(audioPath);
-        const resource = createAudioResource(stream, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: true
-        });
-
-        const player = getPlayer(guildId);
-        connection.subscribe(player);
-        player.play(resource);
-
+// Toca um arquivo e resolve quando o player volta pra Idle (fim, /skip ou erro)
+function playFile(player, audioPath) {
+    return new Promise(resolve => {
         const onStateChange = (oldState, newState) => {
             if (newState.status === AudioPlayerStatus.Idle) {
                 player.off("stateChange", onStateChange);
-
-                // 🗑️ Deleta o arquivo temporário após ser tocado
-                if (fs.existsSync(audioPath)) {
-                    fs.unlink(audioPath, (err) => {
-                        if (err) console.error(`❌ Erro ao deletar o arquivo ${audioPath}:`, err);
-                        else console.log(`🗑️ Arquivo temporário removido: ${audioPath}`);
-                    });
-                }
-
-                isPlayingMap.set(guildId, false);
-                processQueue(guildId);
+                resolve();
             }
         };
 
         player.on("stateChange", onStateChange);
 
-    } catch (error) {
-        console.error("❌ Erro ao reproduzir o TTS na fila:", error);
-        isPlayingMap.set(guildId, false);
-        processQueue(guildId);
+        try {
+            const resource = createAudioResource(fs.createReadStream(audioPath), {
+                inputType: StreamType.Arbitrary
+            });
+            player.play(resource);
+        } catch (error) {
+            console.error("❌ Erro ao reproduzir o TTS:", error.message);
+            player.off("stateChange", onStateChange);
+            resolve();
+        }
+    });
+}
+
+async function processQueue(guildId) {
+    const state = guildStates.get(guildId);
+    if (!state || state.processing) return;
+
+    state.processing = true;
+
+    try {
+        while (state.queue.length > 0) {
+            // Se a conexão caiu, os itens esperam; ela chama processQueue de novo quando voltar
+            if (!isConnectionReady(guildId)) return;
+
+            const item = state.queue[0];
+            const audioPath = await item.audioPromise;
+
+            // O bot saiu da call (ou a fila foi limpa) enquanto o áudio era gerado
+            if (guildStates.get(guildId) !== state || state.queue[0] !== item) {
+                safeUnlink(audioPath);
+                return;
+            }
+
+            state.queue.shift();
+
+            if (!audioPath || !fs.existsSync(audioPath)) {
+                console.error("❌ Arquivo de áudio inválido ou não encontrado, pulando.");
+                continue;
+            }
+
+            const connection = getVoiceConnection(guildId);
+            if (!connection) {
+                safeUnlink(audioPath);
+                return;
+            }
+
+            const player = getPlayer(guildId);
+            connection.subscribe(player);
+
+            await playFile(player, audioPath);
+            safeUnlink(audioPath);
+        }
+    } finally {
+        state.processing = false;
     }
 }
 
 function isGuildPlaying(guildId) {
-    return !!isPlayingMap.get(guildId);
+    const player = players.get(guildId);
+    return !!player && player.state.status !== AudioPlayerStatus.Idle;
 }
 
-function getLastSpeaker(guildId) {
-    return lastSpeakerMap.get(guildId);
+// Diz se o nome do autor deve ser anunciado antes da mensagem e registra o autor atual
+function shouldAnnounceAuthor(guildId, userId) {
+    const state = getState(guildId);
+    const now = Date.now();
+    const last = state.lastSpeaker;
+
+    const announce = !last || last.userId !== userId || now - last.at > AUTHOR_ANNOUNCE_TIMEOUT_MS;
+    state.lastSpeaker = { userId, at: now };
+
+    return announce;
 }
 
-function setLastSpeaker(guildId, userId) {
-    lastSpeakerMap.set(guildId, userId);
-}
+// Descarta fila, estado e player de um servidor (usado quando o bot sai da call)
+async function resetGuild(guildId) {
+    await clearGuildQueue(guildId);
+    guildStates.delete(guildId);
 
-// Limpa o estado de "tocando" e "último autor" de um servidor (usado ao sair da call)
-function resetGuildState(guildId) {
-    isPlayingMap.delete(guildId);
-    lastSpeakerMap.delete(guildId);
-    queueSignals.delete(guildId);
+    const player = players.get(guildId);
+    if (player) {
+        player.stop(true);
+        players.delete(guildId);
+    }
 }
 
 module.exports = {
@@ -255,10 +233,10 @@ module.exports = {
     clearGuildQueue,
     getPlayer,
     getExistingPlayer,
+    isConnectionReady,
     queueSpeech,
     processQueue,
     isGuildPlaying,
-    getLastSpeaker,
-    setLastSpeaker,
-    resetGuildState
+    shouldAnnounceAuthor,
+    resetGuild
 };

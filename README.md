@@ -88,13 +88,11 @@ Emotion presets are implemented in the XTTS2 service and are intended for cloned
 
 The audio queue is designed to handle multiple incoming messages without blocking the Discord event loop.
 
-Speech generation starts asynchronously when a message enters the queue. Generated audio is then played through the Discord voice connection.
+Speech generation starts asynchronously when a message enters the queue, so the next messages are already being synthesized while the current one plays. Playback always follows the order in which messages were sent, so conversations stay coherent.
 
-Instead of strictly waiting for messages in arrival order, the queue can prioritize audio that has already finished generating. This reduces unnecessary waiting when one synthesis request takes longer than another.
+Separate queue and playback states are maintained for each Discord server. Messages are only read while the bot is connected to a voice channel, and each user can have at most three pending messages (twenty per server) to prevent spam. Each message is limited to 300 characters, and links are read as "link".
 
-Separate queue and playback states are maintained for each Discord server.
-
-Temporary audio files are removed after playback, and users can skip the current audio or disconnect the bot.
+Temporary audio files are removed after playback, and users can skip the current audio or disconnect the bot. The bot reconnects automatically after short network drops and leaves the voice channel after one minute without listeners.
 
 ### Desktop Launcher
 
@@ -121,14 +119,18 @@ Uriel Bot provides slash commands for controlling audio playback, configuring TT
 | `/join` | Connects the bot to your current voice channel. |
 | `/leave` | Disconnects the bot from the voice channel. |
 | `/skip` | Skips the currently playing audio. |
-| `/setchannel` | Sets the text channel monitored for TTS messages. |
-| `/mode` | Switches between automatic reading and prefix-based activation. |
-| `/prefix` | Sets the character used to trigger TTS messages. |
-| `/author` | Enables or disables announcing the message author's name. |
+| `/setchannel` | Sets the text channel monitored for TTS messages. *(Manage Server)* |
+| `/mode` | Switches between automatic reading and prefix-based activation. *(Manage Server)* |
+| `/prefix` | Sets the character used to trigger TTS messages. *(Manage Server)* |
+| `/author` | Enables or disables announcing the message author's name. *(Manage Server)* |
 | `/voice` | Selects your personal Edge TTS or cloned voice. |
-| `/clonevoice` | Creates a cloned voice from a reference audio file. |
-| `/deletevoice` | Deletes a stored cloned voice. |
-| `/enrichvoice` | Adds another reference sample to an existing cloned voice. |
+| `/clonevoice` | Creates a cloned voice from a 6–30 second audio file. Requires confirming the speaker's consent and accepts an optional language. |
+| `/deletevoice` | Deletes one of your cloned voices. |
+| `/enrichvoice` | Adds another reference sample to one of your cloned voices. |
+
+Commands marked *(Manage Server)* are only available to members with that permission by default. Server administrators can change this under **Server Settings → Integrations**.
+
+`/deletevoice` and `/enrichvoice` only work on voices you created, unless you have the Manage Server permission. Each user can store up to 5 cloned voices, each voice up to 5 samples, and each server up to 50 voices.
 
 ## 3. Installation and Setup
 
@@ -198,6 +200,8 @@ npm run deploy
 This registers the application's slash commands through the Discord API.
 
 The current deployment script replaces the application's registered global commands, so avoid using it with an application that contains unrelated commands.
+
+Run it again whenever the command definitions change (for example, after updating the bot).
 
 ### Step 5 — Install the XTTS2 Service (Optional)
 

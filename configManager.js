@@ -1,99 +1,65 @@
-const fs = require("fs");
 const path = require("path");
+const { createJsonStore } = require("./src/storage/jsonStore");
 
-// Caminho do arquivo de configuração
-const configPath = path.join(
-    __dirname,
-    "config.json"
-);
+// Arquivo de configuração (por servidor)
+const store = createJsonStore(path.join(__dirname, "config.json"));
 
-// Lê o arquivo JSON (com tratamento para caso ele não exista ou esteja corrompido)
-function loadConfig() {
-    try {
-        if (!fs.existsSync(configPath)) {
-            console.log("⚠️ Arquivo config.json não encontrado. Criando um novo arquivo vazio...");
-            fs.writeFileSync(configPath, JSON.stringify({}, null, 4), "utf8");
-            return {};
-        }
+// Voz padrão do Edge TTS usada quando o usuário nunca configurou nada
+const DEFAULT_VOICE = { type: "edge", value: "es-MX-DaliaNeural" };
 
-        const data = fs.readFileSync(
-            configPath,
-            "utf8"
-        );
-        
-        // Se o arquivo estiver vazio, retorna um objeto vazio
-        if (!data.trim()) {
-            return {};
-        }
-
-        return JSON.parse(data);
-    } catch (error) {
-        console.error("❌ Erro ao ler/analisar o config.json:", error.message);
-        return {}; // Retorna vazio para evitar crash
-    }
+function createDefaultGuildConfig() {
+    return {
+        channelId: null,
+        mode: "all",
+        announceAuthor: true,
+        userVoices: {}
+    };
 }
 
-// Salva alterações no JSON
-function saveConfig(config) {
-    fs.writeFileSync(
-        configPath,
-        JSON.stringify(
-            config,
-            null,
-            4
-        )
-    );
-}
-
-// Retorna a configuração de um servidor
+// Retorna a configuração de um servidor (cria uma padrão se ainda não existir)
 function getGuildConfig(guildId) {
-    const config = loadConfig();
+    const config = store.get();
+    let changed = false;
 
-    // Se o servidor ainda não possui configuração
     if (!config[guildId]) {
-        config[guildId] = {
-            channelId: null,
-            mode: "all",
-            announceAuthor: true,
-            userVoices: {} // Adicionado mapa de vozes por padrão
-        };
-
-        saveConfig(config);
+        config[guildId] = createDefaultGuildConfig();
+        changed = true;
     }
 
     // Garante que a propriedade userVoices exista mesmo em servidores antigos
     if (!config[guildId].userVoices) {
         config[guildId].userVoices = {};
-        saveConfig(config);
+        changed = true;
+    }
+
+    if (changed) {
+        store.save();
     }
 
     return config[guildId];
 }
 
 // Atualiza configurações
-function updateGuildConfig(
-    guildId,
-    data
-) {
-    const config = loadConfig();
+function updateGuildConfig(guildId, data) {
+    const config = store.get();
 
     config[guildId] = {
         ...getGuildConfig(guildId),
         ...data
     };
 
-    saveConfig(config);
+    store.save();
 }
 
-// Retorna a voz do usuário (ou Francisca se não definiu nenhuma)
+// Retorna a voz do usuário no formato { type: "edge" | "clone", value: string }
 function getUserVoice(guildId, userId) {
-    const guildConfig = getGuildConfig(guildId);
-    const voice = guildConfig.userVoices[userId];
+    const voice = getGuildConfig(guildId).userVoices[userId];
 
     if (!voice) {
-        return { type: "edge", value: "es-MX-DaliaNeural" };
+        return DEFAULT_VOICE;
     }
 
+    // Formato antigo: só o nome da voz do Edge
     if (typeof voice === "string") {
         return { type: "edge", value: voice };
     }
@@ -103,18 +69,32 @@ function getUserVoice(guildId, userId) {
 
 // Salva a voz escolhida pelo usuário
 function setUserVoice(guildId, userId, voice) {
-    const guildConfig = getGuildConfig(guildId);
-    
-    guildConfig.userVoices[userId] = voice;
+    getGuildConfig(guildId).userVoices[userId] = voice;
+    store.save();
+}
 
-    updateGuildConfig(guildId, {
-        userVoices: guildConfig.userVoices
-    });
+// Remove de todos os usuários do servidor uma voz clonada que foi apagada
+function clearClonedVoiceSelections(guildId, voiceId) {
+    const { userVoices } = getGuildConfig(guildId);
+    let changed = false;
+
+    for (const [userId, voice] of Object.entries(userVoices)) {
+        if (voice && voice.type === "clone" && voice.value === voiceId) {
+            delete userVoices[userId];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        store.save();
+    }
 }
 
 module.exports = {
+    DEFAULT_VOICE,
     getGuildConfig,
     updateGuildConfig,
     getUserVoice,
-    setUserVoice
+    setUserVoice,
+    clearClonedVoiceSelections
 };

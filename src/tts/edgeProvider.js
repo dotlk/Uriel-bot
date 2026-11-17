@@ -1,6 +1,7 @@
 const { EdgeTTS } = require("@andresaya/edge-tts");
 const path = require("path");
 const fs = require("fs");
+const { randomUUID } = require("crypto");
 
 // Garante que a pasta 'audio' existe UMA ÚNICA VEZ ao iniciar o módulo
 const audioDir = path.join(__dirname, "..", "..", "audio");
@@ -15,7 +16,7 @@ async function generateSpeech(text, voice = "pt-BR-FranciscaNeural") {
         outputFormat: "audio-24khz-48kbitrate-mono-mp3"
     });
 
-    const outputWithoutExt = path.join(audioDir, `speech-${Date.now()}`);
+    const outputWithoutExt = path.join(audioDir, `speech-${randomUUID()}`);
     await tts.toFile(outputWithoutExt);
 
     return `${outputWithoutExt}.mp3`;
