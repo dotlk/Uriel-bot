@@ -1,28 +1,9 @@
 
 # Uriel Bot — Discord Text-to-Speech
 
-#### CS50x Final Project
-
-**Author:** [dotlk](https://github.com/dotlk)  
-**Project Repository:** [Uriel Bot](https://github.com/dotlk/Uriel-bot)  
-**Video Demonstration:** Coming soon
-
-For installation instructions, see [Installation and Setup](#3-installation-and-setup).  
-For instructions on running the application, see [Starting the Bot](#4-starting-the-bot).
-
-**Description:**
-
-Uriel Bot was developed as a final project for CS50x: Introduction to Computer Science.
-
-The project brings together concepts learned throughout the course, including algorithms, data structures, asynchronous execution, software architecture, and integration between different programming languages.
-
-Its central objective is to transform Discord text communication into configurable spoken interaction while supporting both traditional text-to-speech and neural voice cloning.
-
 ## 1. Project Overview
 
 Uriel Bot is a Discord text-to-speech (TTS) application that converts text messages into spoken audio inside Discord voice channels. It supports multiple synthetic voices, AI-powered voice cloning, individual voice preferences, emotional speech presets, and configurable message-reading behavior.
-
-The project was developed as a final project for Harvard University's CS50x: Introduction to Computer Science.
 
 The main goal is to make text-based communication more accessible and interactive in Discord voice channels. Users can participate in voice conversations without using a microphone, while other participants hear their messages through synthesized speech.
 
