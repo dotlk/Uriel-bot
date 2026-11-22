@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const FormData = require("form-data");
+const { randomUUID } = require("crypto");
 
 const { getVoice, getReferencePaths } = require("../voices/voiceRegistry");
 
@@ -14,7 +15,7 @@ const XTTS_SERVICE_URL = process.env.XTTS_SERVICE_URL;
 
 // Gera fala usando uma voz clonada, chamando o microserviço Python que roda o XTTS2.
 // voiceId: o id gerado pelo /clonevoice (referencia uma ou mais amostras salvas em voices/<voiceId>/)
-async function generateSpeech(text, voiceId, language = "pt") {
+async function generateSpeech(text, voiceId) {
     if (!XTTS_SERVICE_URL) {
         throw new Error("❌ XTTS_SERVICE_URL não configurada no .env — defina o endereço do serviço Python.");
     }
@@ -31,12 +32,13 @@ async function generateSpeech(text, voiceId, language = "pt") {
 
     const form = new FormData();
     form.append("text", text);
-    form.append("language", language);
+    // Vozes antigas (criadas antes da opção de idioma) continuam em português
+    form.append("language", voiceMeta.language || "pt");
 
     // Manda TODAS as amostras de referência dessa voz — o XTTS2 combina todas
     // pra montar uma condicionante mais rica (mesmo campo repetido = lista no FastAPI)
     for (const refPath of referencePaths) {
-        form.append("reference_audio", fs.createReadStream(refPath));
+        form.append("reference_audio", fs.createReadStream(refPath), path.basename(refPath));
     }
 
     const response = await axios.post(`${XTTS_SERVICE_URL}/synthesize`, form, {
@@ -45,7 +47,7 @@ async function generateSpeech(text, voiceId, language = "pt") {
         timeout: 120_000 // XTTS pode demorar, principalmente em CPU
     });
 
-    const outputPath = path.join(audioDir, `speech-clone-${Date.now()}.wav`);
+    const outputPath = path.join(audioDir, `speech-clone-${randomUUID()}.wav`);
     fs.writeFileSync(outputPath, response.data);
 
     return outputPath;

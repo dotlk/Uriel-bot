@@ -1,44 +1,100 @@
-
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const { randomUUID } = require("crypto");
 
-const { Events } = require("discord.js");
+const { Events, MessageFlags, PermissionFlagsBits } = require("discord.js");
+const { getVoiceConnection } = require("@discordjs/voice");
 
-const {
-    joinVoiceChannel,
-    getVoiceConnection,
-    entersState,
-    VoiceConnectionStatus
-} = require("@discordjs/voice");
+const { getExistingPlayer, isGuildPlaying } = require("../audio/queueManager");
+const { connectToChannel } = require("../audio/voiceConnection");
+const { getAudioDurationSeconds } = require("../audio/audioProbe");
 
-const {
-    getPlayer,
-    getExistingPlayer,
-    isGuildPlaying,
-    clearGuildQueue,
-    resetGuildState
-} = require("../audio/queueManager");
-
-const { getGuildConfig, updateGuildConfig, setUserVoice } = require("../../configManager");
+const { getGuildConfig, updateGuildConfig, setUserVoice, clearClonedVoiceSelections } = require("../../configManager");
 const { registerVoice, getVoice, listVoices, deleteVoice, addVoiceSample, getReferencePaths, VOICES_DIR } = require("../voices/voiceRegistry");
 const EDGE_VOICES = require("../tts/edgeVoices");
 
-// Extensões aceitas como reserva, caso o Discord não informe o content-type corretamente
+// Extensões aceitas para os áudios de referência
 const ALLOWED_AUDIO_EXTENSIONS = [".mp3", ".wav"];
 // Limite de tamanho do arquivo de referência (a voz é clonada com poucos segundos, não precisa de mais que isso)
 const MAX_AUDIO_SIZE = 15 * 1024 * 1024; // 15 MB
+// Duração aceita para cada amostra (com meio segundo de tolerância)
+const MIN_SAMPLE_SECONDS = 6;
+const MAX_SAMPLE_SECONDS = 30;
+const DURATION_TOLERANCE_SECONDS = 0.5;
+// Limites para evitar que o disco seja lotado de vozes
+const MAX_VOICES_PER_USER = 5;
+const MAX_VOICES_PER_GUILD = 50;
+const MAX_SAMPLES_PER_VOICE = 5;
+// O Discord só aceita nomes de até 100 caracteres nas sugestões do autocomplete
+const MAX_LABEL_LENGTH = 50;
 
-// 🔎 Responde ao autocomplete do /voice (vozes clonadas + Edge) e do /deletevoice (só as vozes do próprio usuário)
+const EPHEMERAL = { flags: MessageFlags.Ephemeral };
+
+// Quem pode apagar/alterar uma voz: o dono dela ou quem pode gerenciar o servidor
+function canManageVoice(interaction, voiceMeta) {
+    return voiceMeta.ownerId === interaction.user.id ||
+        interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+}
+
+// Valida o anexo antes de baixar. Retorna a extensão a usar ou uma mensagem de erro.
+function validateAttachment(attachment) {
+    const contentType = (attachment.contentType || "").split(";")[0].trim().toLowerCase();
+    const extension = path.extname(attachment.name || "").toLowerCase();
+
+    if (!contentType.startsWith("audio/") && !ALLOWED_AUDIO_EXTENSIONS.includes(extension)) {
+        return { error: "❌ The file must be an audio file (.mp3 or .wav)." };
+    }
+
+    if (attachment.size > MAX_AUDIO_SIZE) {
+        return { error: "❌ Audio file is too large. Upload a 6–30 second clip up to 15 MB." };
+    }
+
+    // Nunca usa a extensão enviada pelo usuário se ela não for uma das permitidas
+    if (ALLOWED_AUDIO_EXTENSIONS.includes(extension)) {
+        return { extension };
+    }
+    return { extension: contentType.includes("wav") ? ".wav" : ".mp3" };
+}
+
+// Baixa o anexo e confere se é mesmo um áudio com a duração certa.
+// Em caso de problema apaga o arquivo e retorna uma mensagem de erro.
+async function downloadSample(attachment, destinationPath) {
+    const response = await axios.get(attachment.url, {
+        responseType: "arraybuffer",
+        maxContentLength: MAX_AUDIO_SIZE,
+        timeout: 30_000
+    });
+    fs.writeFileSync(destinationPath, response.data);
+
+    const duration = await getAudioDurationSeconds(destinationPath);
+
+    if (duration === null) {
+        fs.rmSync(destinationPath, { force: true });
+        return "❌ Could not read this file as audio. Please upload a valid .mp3 or .wav file.";
+    }
+
+    if (duration < MIN_SAMPLE_SECONDS - DURATION_TOLERANCE_SECONDS ||
+        duration > MAX_SAMPLE_SECONDS + DURATION_TOLERANCE_SECONDS) {
+        fs.rmSync(destinationPath, { force: true });
+        return `❌ The audio is ${duration.toFixed(1)} seconds long. Please upload a clip between ` +
+            `${MIN_SAMPLE_SECONDS} and ${MAX_SAMPLE_SECONDS} seconds.`;
+    }
+
+    return null;
+}
+
+// 🔎 Responde ao autocomplete do /voice (vozes clonadas + Edge) e do /deletevoice e /enrichvoice
 async function handleAutocomplete(interaction) {
+    if (!interaction.inGuild()) return interaction.respond([]).catch(() => {});
+
     const focused = interaction.options.getFocused().toLowerCase();
 
     if (interaction.commandName === "voice") {
-        const clonedChoices = listVoices(interaction.guild.id)
+        const clonedChoices = listVoices(interaction.guildId)
             .filter(v => v.label.toLowerCase().includes(focused))
             .map(v => ({
-                name: `🗣️ ${v.label} (cloned)`,
+                name: `🗣️ ${v.label} (cloned)`.slice(0, 100),
                 value: `clone:${v.voiceId}`
             }));
 
@@ -55,298 +111,332 @@ async function handleAutocomplete(interaction) {
     }
 
     if (interaction.commandName === "deletevoice" || interaction.commandName === "enrichvoice") {
-        // Lista qualquer voz clonada no servidor (não só as do próprio usuário)
-        const allChoices = listVoices(interaction.guild.id)
+        // Só sugere as vozes que o usuário pode alterar (as dele, ou todas se for admin)
+        const choices = listVoices(interaction.guildId)
+            .filter(v => canManageVoice(interaction, v))
             .filter(v => v.label.toLowerCase().includes(focused))
             .map(v => ({
-                name: interaction.commandName === "deletevoice" ? `🗑️ ${v.label}` : `🎙️ ${v.label}`,
+                name: `${interaction.commandName === "deletevoice" ? "🗑️" : "🎙️"} ${v.label}`.slice(0, 100),
                 value: v.voiceId
             }))
             .slice(0, 25);
 
-        return interaction.respond(allChoices).catch(() => {});
+        return interaction.respond(choices).catch(() => {});
+    }
+}
+
+async function handleCommand(interaction) {
+    switch (interaction.commandName) {
+        case "join": {
+            const voiceChannel = interaction.member.voice.channel;
+
+            if (!voiceChannel) {
+                return interaction.reply({
+                    content: "❌ You need to join a voice channel first.",
+                    ...EPHEMERAL
+                });
+            }
+
+            await interaction.deferReply();
+
+            try {
+                await connectToChannel(voiceChannel);
+                console.log("🔌 Connection status: READY");
+                await interaction.editReply(`✅ Joined **${voiceChannel.name}**!`);
+            } catch (error) {
+                console.error("❌ Voice connection error:", error);
+                await interaction.editReply("❌ Failed to connect to the voice channel.");
+            }
+            return;
+        }
+
+        case "skip": {
+            const player = getExistingPlayer(interaction.guildId);
+
+            if (!player || !isGuildPlaying(interaction.guildId)) {
+                return interaction.reply({
+                    content: "⚠️ There is no audio currently playing to skip.",
+                    ...EPHEMERAL
+                });
+            }
+
+            player.stop();
+            return interaction.reply("⏭️ Audio skipped!");
+        }
+
+        case "voice": {
+            await interaction.deferReply(EPHEMERAL);
+
+            const raw = interaction.options.getString("voice");
+            const separatorIndex = raw.indexOf(":");
+            const type = raw.slice(0, separatorIndex);
+            const value = raw.slice(separatorIndex + 1);
+
+            if (type !== "edge" && type !== "clone") {
+                return interaction.editReply(
+                    "❌ Invalid voice. Type to search and select one of the suggested options."
+                );
+            }
+
+            let label;
+            if (type === "clone") {
+                const voiceMeta = getVoice(value);
+                // Só aceita vozes clonadas deste servidor
+                if (!voiceMeta || voiceMeta.guildId !== interaction.guildId) {
+                    return interaction.editReply("❌ This cloned voice no longer exists. Please select another one.");
+                }
+                label = voiceMeta.label;
+            } else {
+                const edgeVoice = EDGE_VOICES.find(v => v.value === value);
+                if (!edgeVoice) {
+                    return interaction.editReply(
+                        "❌ Invalid voice. Type to search and select one of the suggested options."
+                    );
+                }
+                label = edgeVoice.name;
+            }
+
+            setUserVoice(interaction.guildId, interaction.user.id, { type, value });
+
+            return interaction.editReply(`✅ Your personal voice has been set to **${label}**!`);
+        }
+
+        case "setchannel": {
+            await interaction.deferReply();
+
+            const channel = interaction.options.getChannel("channel");
+
+            updateGuildConfig(interaction.guildId, { channelId: channel.id, mode: "all" });
+
+            return interaction.editReply(
+                `✅ TTS channel set to: ${channel}\n` +
+                `✅ TTS mode set to **All Messages**.`
+            );
+        }
+
+        case "mode": {
+            const mode = interaction.options.getString("type");
+            const config = getGuildConfig(interaction.guildId);
+
+            // O modo "prefix" só pode ser ativado se já houver um prefixo cadastrado
+            if (mode === "prefix" && !config.prefix) {
+                return interaction.reply({
+                    content: "❌ You must set a prefix before switching to prefix mode!",
+                    ...EPHEMERAL
+                });
+            }
+
+            updateGuildConfig(interaction.guildId, { mode });
+
+            return interaction.reply(`✅ Mode changed to **${mode}**`);
+        }
+
+        case "prefix": {
+            const prefix = interaction.options.getString("symbol").trim();
+
+            if (!prefix) {
+                return interaction.reply({ content: "❌ The prefix cannot be empty.", ...EPHEMERAL });
+            }
+
+            updateGuildConfig(interaction.guildId, { prefix });
+
+            return interaction.reply(`✅ Prefix set to **${prefix}**`);
+        }
+
+        case "author": {
+            const enabled = interaction.options.getBoolean("enabled");
+            updateGuildConfig(interaction.guildId, { announceAuthor: enabled });
+
+            return interaction.reply(`✅ Announce author: **${enabled ? "enabled" : "disabled"}**`);
+        }
+
+        case "clonevoice": {
+            await interaction.deferReply(EPHEMERAL);
+
+            const attachment = interaction.options.getAttachment("audio");
+            const label = interaction.options.getString("name").trim().slice(0, MAX_LABEL_LENGTH);
+            const consent = interaction.options.getBoolean("consent");
+            const language = interaction.options.getString("language") || "pt";
+
+            if (!consent) {
+                return interaction.editReply(
+                    "❌ You can only clone a voice with the speaker's permission. " +
+                    "Set **consent** to True to confirm you have it."
+                );
+            }
+
+            if (!label) {
+                return interaction.editReply("❌ The voice name cannot be empty.");
+            }
+
+            if (listVoices(interaction.guildId, interaction.user.id).length >= MAX_VOICES_PER_USER) {
+                return interaction.editReply(
+                    `❌ You already have ${MAX_VOICES_PER_USER} cloned voices. Delete one with \`/deletevoice\` first.`
+                );
+            }
+
+            if (listVoices(interaction.guildId).length >= MAX_VOICES_PER_GUILD) {
+                return interaction.editReply(
+                    `❌ This server already has ${MAX_VOICES_PER_GUILD} cloned voices. Delete some with \`/deletevoice\` first.`
+                );
+            }
+
+            const { extension, error } = validateAttachment(attachment);
+            if (error) return interaction.editReply(error);
+
+            const voiceId = randomUUID();
+            const voiceDir = path.join(VOICES_DIR, interaction.guildId, voiceId);
+
+            try {
+                fs.mkdirSync(voiceDir, { recursive: true });
+                const referencePath = path.join(voiceDir, `reference${extension}`);
+
+                // Baixa o áudio anexado no Discord e salva como referência da voz
+                const sampleError = await downloadSample(attachment, referencePath);
+                if (sampleError) {
+                    fs.rmSync(voiceDir, { recursive: true, force: true });
+                    return interaction.editReply(sampleError);
+                }
+
+                registerVoice({
+                    voiceId,
+                    label,
+                    ownerId: interaction.user.id,
+                    guildId: interaction.guildId,
+                    referencePath,
+                    language
+                });
+
+                setUserVoice(interaction.guildId, interaction.user.id, { type: "clone", value: voiceId });
+
+                return interaction.editReply(
+                    `✅ Voice **${label}** cloned, saved and set as your voice!\n` +
+                    `Use \`/voice\` to switch voices whenever you want.`
+                );
+            } catch (error) {
+                console.error("❌ Voice cloning error:", error);
+                fs.rmSync(voiceDir, { recursive: true, force: true });
+                return interaction.editReply("❌ Failed to process the uploaded audio. Please try again.");
+            }
+        }
+
+        case "deletevoice": {
+            await interaction.deferReply(EPHEMERAL);
+
+            const voiceId = interaction.options.getString("voice");
+            const voiceMeta = getVoice(voiceId);
+
+            if (!voiceMeta || voiceMeta.guildId !== interaction.guildId) {
+                return interaction.editReply("❌ This voice does not exist or has already been deleted.");
+            }
+
+            if (!canManageVoice(interaction, voiceMeta)) {
+                return interaction.editReply("❌ You can only delete voices you created.");
+            }
+
+            deleteVoice(voiceId);
+            clearClonedVoiceSelections(interaction.guildId, voiceId);
+
+            return interaction.editReply(`🗑️ Voice **${voiceMeta.label}** deleted successfully.`);
+        }
+
+        case "enrichvoice": {
+            await interaction.deferReply(EPHEMERAL);
+
+            const voiceId = interaction.options.getString("voice");
+            const attachment = interaction.options.getAttachment("audio");
+
+            const voiceMeta = getVoice(voiceId);
+            if (!voiceMeta || voiceMeta.guildId !== interaction.guildId) {
+                return interaction.editReply("❌ This voice does not exist or has already been deleted. Select one of the suggested options.");
+            }
+
+            if (!canManageVoice(interaction, voiceMeta)) {
+                return interaction.editReply("❌ You can only add samples to voices you created.");
+            }
+
+            const referencePaths = getReferencePaths(voiceMeta);
+            if (referencePaths.length >= MAX_SAMPLES_PER_VOICE) {
+                return interaction.editReply(`❌ This voice already has the maximum of ${MAX_SAMPLES_PER_VOICE} samples.`);
+            }
+
+            const { extension, error } = validateAttachment(attachment);
+            if (error) return interaction.editReply(error);
+
+            // Usa a mesma pasta das amostras existentes (vozes antigas podem estar em outro layout)
+            const voiceDir = referencePaths.length > 0
+                ? path.dirname(referencePaths[0])
+                : path.join(VOICES_DIR, interaction.guildId, voiceId);
+            // UUID no nome evita sobrescrever uma amostra existente
+            const newSamplePath = path.join(voiceDir, `sample_${randomUUID()}${extension}`);
+
+            try {
+                fs.mkdirSync(voiceDir, { recursive: true });
+
+                const sampleError = await downloadSample(attachment, newSamplePath);
+                if (sampleError) return interaction.editReply(sampleError);
+
+                const totalSamples = addVoiceSample(voiceId, newSamplePath);
+
+                return interaction.editReply(
+                    `✅ Voice **${voiceMeta.label}** enhanced! It now has **${totalSamples}** reference sample(s).`
+                );
+            } catch (error) {
+                console.error("❌ Voice enhancement error:", error);
+                fs.rmSync(newSamplePath, { force: true });
+                return interaction.editReply("❌ Failed to process the uploaded audio. Please try again.");
+            }
+        }
+
+        case "leave": {
+            const connection = getVoiceConnection(interaction.guildId);
+
+            if (!connection) {
+                return interaction.reply({
+                    content: "❌ I am not connected to a voice channel.",
+                    ...EPHEMERAL
+                });
+            }
+
+            // A fila, os áudios pendentes e o estado são limpos pelo handler de "Destroyed"
+            connection.destroy();
+            return interaction.reply("👋 Left the voice channel!");
+        }
+
+        default:
+            return;
     }
 }
 
 module.exports = function registerInteractionCreateEvent(client) {
     client.on(Events.InteractionCreate, async (interaction) => {
-        if (interaction.isAutocomplete()) {
-            return handleAutocomplete(interaction);
-        }
-
-        if (!interaction.isChatInputCommand()) return;
-
-        switch (interaction.commandName) {
-            case "join": {
-                const voiceChannel = interaction.member.voice.channel;
-
-                if (!voiceChannel) {
-                    return interaction.reply({
-                        content: "❌ You need to join a voice channel first.",
-                        ephemeral: true
-                    });
-                }
-
-                await interaction.deferReply();
-
-                try {
-                    const connection = joinVoiceChannel({
-                        channelId: voiceChannel.id,
-                        guildId: interaction.guild.id,
-                        adapterCreator: interaction.guild.voiceAdapterCreator,
-                        selfDeaf: false,
-                        selfMute: false
-                    });
-
-                    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-
-                    const player = getPlayer(interaction.guild.id);
-                    connection.subscribe(player);
-
-                    console.log("🔌 Connection status: READY");
-                    await interaction.editReply(`✅ Joined **${voiceChannel.name}**!`);
-                } catch (error) {
-                    console.error("❌ Voice connection error:", error);
-                    await interaction.editReply("❌ Failed to connect to the voice channel.");
-                }
-
-                break;
+        try {
+            if (interaction.isAutocomplete()) {
+                return await handleAutocomplete(interaction);
             }
 
-            case "skip": {
-                const player = getExistingPlayer(interaction.guild.id);
-                const isPlaying = isGuildPlaying(interaction.guild.id);
+            if (!interaction.isChatInputCommand()) return;
 
-                if (!player || !isPlaying) {
-                    return interaction.reply({
-                        content: "⚠️ There is no audio currently playing to skip.",
-                        ephemeral: true
-                    });
-                }
-
-                player.stop();
-                await interaction.reply("⏭️ Audio skipped!");
-                break;
-            }
-
-            case "voice": {
-                await interaction.deferReply({ ephemeral: true });
-
-                const raw = interaction.options.getString("voice");
-                const separatorIndex = raw.indexOf(":");
-                const type = raw.slice(0, separatorIndex);
-                const value = raw.slice(separatorIndex + 1);
-
-                if (type !== "edge" && type !== "clone") {
-                    return interaction.editReply(
-                        "❌ Invalid voice. Type to search and select one of the suggested options."
-                    );
-                }
-
-                if (type === "clone" && !getVoice(value)) {
-                    return interaction.editReply("❌ This cloned voice no longer exists. Please select another one.");
-                }
-
-                setUserVoice(interaction.guild.id, interaction.user.id, { type, value });
-
-                const label = type === "clone"
-                    ? getVoice(value).label
-                    : (EDGE_VOICES.find(v => v.value === value)?.name || value);
-
-                await interaction.editReply({
-                    content: `✅ Your personal voice has been set to **${label}**!`
+            // Todos os comandos dependem de um servidor (canal de voz, config, vozes)
+            if (!interaction.inGuild()) {
+                return await interaction.reply({
+                    content: "❌ This command can only be used inside a server.",
+                    ...EPHEMERAL
                 });
-                break;
             }
 
-            case "setchannel": {
-                await interaction.deferReply();
+            await handleCommand(interaction);
+        } catch (error) {
+            console.error(`❌ Error handling /${interaction.commandName}:`, error);
 
-                const channel = interaction.options.getChannel("channel");
+            if (!interaction.isRepliable()) return;
 
-                updateGuildConfig(interaction.guild.id, { channelId: channel.id });
-                updateGuildConfig(interaction.guild.id, { mode: "all" });
+            const content = "❌ Something went wrong while running this command.";
+            const reply = interaction.deferred || interaction.replied
+                ? interaction.editReply(content)
+                : interaction.reply({ content, ...EPHEMERAL });
 
-                await interaction.editReply(
-                    `✅ TTS channel set to: ${channel}\n` +
-                    `✅ TTS mode set to **All Messages**.`
-                );
-                break;
-            }
-
-            case "mode": {
-                await interaction.deferReply();
-
-                const mode = interaction.options.getString("type");
-                const config = getGuildConfig(interaction.guild.id);
-
-                // Se o usuário tentar colocar o modo "prefix", valida se ele já possui um prefixo cadastrado (Mensagem Privada)
-                if (mode === "prefix" && !config.prefix) {
-                    await interaction.deleteReply().catch(() => {});
-                    return interaction.followUp({
-                        content: "❌ You must set a prefix before switching to prefix mode!",
-                        ephemeral: true
-                    });
-                }
-
-                updateGuildConfig(interaction.guild.id, { mode: mode });
-
-                // (Mensagem pública)
-                await interaction.editReply(`✅ Mode changed to **${mode}**`);
-                break;
-            }
-
-            case "prefix": {
-                await interaction.deferReply();
-
-                const prefix = interaction.options.getString("symbol");
-                updateGuildConfig(interaction.guild.id, { prefix: prefix });
-
-                await interaction.editReply(`✅ Prefix set to **${prefix}**`);
-                break;
-            }
-
-            case "author": {
-                await interaction.deferReply();
-
-                const enabled = interaction.options.getBoolean("enabled");
-                updateGuildConfig(interaction.guild.id, { announceAuthor: enabled });
-
-                await interaction.editReply(`✅ Announce author: **${enabled ? "enabled" : "disabled"}**`);
-                break;
-            }
-
-            case "clonevoice": {
-                await interaction.deferReply({ ephemeral: true });
-
-                const attachment = interaction.options.getAttachment("audio");
-                const label = interaction.options.getString("name");
-
-                const contentType = (attachment.contentType || "").split(";")[0].trim().toLowerCase();
-                const extension = path.extname(attachment.name || "").toLowerCase();
-
-                const isAudio = contentType.startsWith("audio/") || ALLOWED_AUDIO_EXTENSIONS.includes(extension);
-                if (!isAudio) {
-                    return interaction.editReply("❌ The file must be an audio file (.mp3 or .wav).");
-                }
-
-                if (attachment.size > MAX_AUDIO_SIZE) {
-                    return interaction.editReply("❌ Audio file is too large. Upload a 6–30 second clip up to 15 MB.");
-                }
-
-                try {
-                    const voiceId = randomUUID();
-                    const ext = path.extname(attachment.name) || ".mp3";
-                    const voiceDir = path.join(VOICES_DIR, interaction.guild.id, voiceId);
-                    fs.mkdirSync(voiceDir, { recursive: true });
-                    const referencePath = path.join(voiceDir, `reference${ext}`);
-
-                    // Baixa o áudio anexado no Discord e salva como referência da voz
-                    const response = await axios.get(attachment.url, { responseType: "arraybuffer" });
-                    fs.writeFileSync(referencePath, response.data);
-
-                    registerVoice({
-                        voiceId,
-                        label,
-                        ownerId: interaction.user.id,
-                        guildId: interaction.guild.id,
-                        referencePath
-                    });
-
-                    await interaction.editReply(
-                        `✅ Voice **${label}** cloned and saved successfully!\n` +
-                        `Use \`/voice\` to select it whenever you want.`
-                    );
-                } catch (error) {
-                    console.error("❌ Voice cloning error:", error);
-                    await interaction.editReply("❌ Failed to process the uploaded audio. Please try again.");
-                }
-
-                break;
-            }
-
-            case "deletevoice": {
-                await interaction.deferReply({ ephemeral: true });
-
-                const voiceId = interaction.options.getString("voice");
-                const voiceMeta = getVoice(voiceId);
-
-                if (!voiceMeta) {
-                    return interaction.editReply("❌ This voice does not exist or has already been deleted.");
-                }
-
-                deleteVoice(voiceId);
-
-                await interaction.editReply(`🗑️ Voice **${voiceMeta.label}** deleted successfully.`);
-                break;
-            }
-
-            case "enrichvoice": {
-                await interaction.deferReply({ ephemeral: true });
-
-                const voiceId = interaction.options.getString("voice");
-                const attachment = interaction.options.getAttachment("audio");
-
-                const voiceMeta = getVoice(voiceId);
-                if (!voiceMeta) {
-                    return interaction.editReply("❌ This voice does not exist or has already been deleted. Select one of the suggested options.");
-                }
-
-                const contentType = (attachment.contentType || "").split(";")[0].trim().toLowerCase();
-                const extension = path.extname(attachment.name || "").toLowerCase();
-
-                const isAudio = contentType.startsWith("audio/") || ALLOWED_AUDIO_EXTENSIONS.includes(extension);
-                if (!isAudio) {
-                    return interaction.editReply("❌ The file must be an audio file (.mp3 or .wav).");
-                }
-
-                if (attachment.size > MAX_AUDIO_SIZE) {
-                    return interaction.editReply("❌ Audio file is too large. Upload a 6–30 second clip up to 15 MB.");
-                }
-
-                try {
-                    const voiceDir = path.dirname(getReferencePaths(voiceMeta)[0]);
-                    const sampleNumber = getReferencePaths(voiceMeta).length + 1;
-                    const ext = path.extname(attachment.name) || ".mp3";
-                    const newSamplePath = path.join(voiceDir, `sample_${sampleNumber}${ext}`);
-
-                    const response = await axios.get(attachment.url, { responseType: "arraybuffer" });
-                    fs.writeFileSync(newSamplePath, response.data);
-
-                    const totalSamples = addVoiceSample(voiceId, newSamplePath);
-
-                    await interaction.editReply(
-                        `✅ Voice **${voiceMeta.label}** enhanced! It now has **${totalSamples}** reference sample(s).`
-                    );
-                } catch (error) {
-                    console.error("❌ Voice enhancement error:", error);
-                    await interaction.editReply("❌ Failed to process the uploaded audio. Please try again.");
-                }
-
-                break;
-            }
-
-            case "leave": {
-                const connection = getVoiceConnection(interaction.guild.id);
-
-                if (!connection) {
-                    return interaction.reply({
-                        content: "❌ I am not connected to a voice channel.",
-                        ephemeral: true
-                    });
-                }
-
-                // 🧹 Limpa os arquivos de áudio não tocados da fila antes de sair
-                await clearGuildQueue(interaction.guild.id);
-                resetGuildState(interaction.guild.id);
-
-                connection.destroy();
-                await interaction.reply("👋 Left the voice channel!");
-                break;
-            }
-
-            default:
-                break;
+            await reply.catch(() => {});
         }
     });
 };

@@ -11,9 +11,10 @@ node_modules/
 
 # Config e registros gerados em runtime
 config.json
+config.json.*
 
 # Vozes clonadas pelos usuários (áudios de referência)
-voices/
+/voices/
 
 # --- Coquixttsv2 ---
 xtts-service/.venv/
